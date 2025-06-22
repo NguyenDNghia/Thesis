@@ -1,0 +1,106 @@
+---
+- name: Isolate Target Host (IPTABLES Commands Only - Temporary Rules)
+  hosts: all
+  gather_facts: yes
+  become: true    # Bắt buộc để chạy iptables
+
+  vars:
+    management_ips:
+      - "10.11.13.3"
+
+  tasks:
+    - name: "Check if current host is the target for isolation"
+      ansible.builtin.set_fact:
+        is_target_for_isolation: >-
+          {{ (host_to_isolate is defined) and
+             (host_to_isolate == ansible_host or
+              host_to_isolate == inventory_hostname or
+              host_to_isolate in (ansible_all_ipv4_addresses | default([])) or
+              (ansible_all_ipv6_addresses is defined and host_to_isolate in (ansible_all_ipv6_addresses | default([])))
+             )
+          }}
+
+    - name: "Display host target status"
+      ansible.builtin.debug:
+        msg: >-
+          Host {{ inventory_hostname }} (Primary IP: {{ ansible_default_ipv4.address | default('N/A') }})
+          IS {{ 'THE TARGET' if is_target_for_isolation else 'NOT the target' }}
+          for isolation (Target IP specified: {{ host_to_isolate | default('NOT_SET') }}).
+
+    - name: "Apply IPTABLES isolation rules (Temporary)"
+      when: is_target_for_isolation
+      block:
+        - name: "Flush INPUT chain"
+          ansible.builtin.command: iptables -F INPUT
+          changed_when: true
+        - name: "Flush OUTPUT chain"
+          ansible.builtin.command: iptables -F OUTPUT
+          changed_when: true
+        - name: "Flush FORWARD chain"
+          ansible.builtin.command: iptables -F FORWARD
+          changed_when: true
+        - name: "Flush all non-default chains (-X)"
+          ansible.builtin.command: iptables -X
+          changed_when: true
+        - name: "Zero all packet and byte counters (-Z)"
+          ansible.builtin.command: iptables -Z
+          changed_when: true
+
+        # Set default policies to DROP
+        - name: "Set default INPUT policy to DROP"
+          ansible.builtin.command: iptables -P INPUT DROP
+          changed_when: true
+        - name: "Set default FORWARD policy to DROP"
+          ansible.builtin.command: iptables -P FORWARD DROP
+          changed_when: true
+        - name: "Set default OUTPUT policy to DROP"
+          ansible.builtin.command: iptables -P OUTPUT DROP
+          changed_when: true
+
+        # Allow loopback traffic
+        - name: "Allow INPUT on loopback interface"
+          ansible.builtin.command: iptables -A INPUT -i lo -j ACCEPT
+          changed_when: true
+        - name: "Allow OUTPUT on loopback interface"
+          ansible.builtin.command: iptables -A OUTPUT -o lo -j ACCEPT
+          changed_when: true
+
+        # Allow established and related connections
+        - name: "Allow ESTABLISHED,RELATED for INPUT"
+          ansible.builtin.command: iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+          changed_when: true
+        - name: "Allow ESTABLISHED,RELATED for OUTPUT"
+          ansible.builtin.command: iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+          changed_when: true
+
+        # Allow incoming SSH from management IPs
+        - name: "Allow incoming SSH from management IPs"
+          ansible.builtin.command: "iptables -A INPUT -p tcp -s {{ item }} --dport 22 -j ACCEPT -m comment --comment \"Allow SSH from management IP {{ item }}\""
+          loop: "{{ management_ips }}"
+          when: management_ips is defined and management_ips | length > 0
+          changed_when: true
+
+        - name: "Allow outgoing traffic to Elasticsearch (if configured)"
+          ansible.builtin.command: "iptables -A OUTPUT -p tcp -d {{ elasticsearch_server_ip }} --dport {{ elasticsearch_server_port }} -j ACCEPT -m comment --comment \"Allow Elastic Agent to send logs\""
+          when:
+            - allow_elastic_agent_outbound | default(false)
+            - elasticsearch_server_ip is defined
+            - elasticsearch_server_port is defined
+          changed_when: true
+
+        - name: "Allow outgoing DNS traffic (if configured)"
+          ansible.builtin.command: "iptables -A OUTPUT -p {{ item.protocol }} -d {{ item.server }} --dport 53 -j ACCEPT -m comment --comment \"Allow DNS to {{ item.server }}\""
+          loop: "{{ dns_servers | default([]) }}"
+          loop_control:
+            loop_var: item
+          when: allow_dns_outbound | default(false)
+          changed_when: true
+
+        - name: "Temporary IPTABLES isolation rules applied on {{ inventory_hostname }}"
+          ansible.builtin.debug:
+            msg: "Temporary IPTABLES isolation rules have been applied on {{ inventory_hostname }}. These rules will be lost on reboot unless saved manually or by another process."
+
+    - name: "Host {{ inventory_hostname }} is not the target, skipping isolation."
+      ansible.builtin.debug:
+        msg: "Skipping IPTABLES isolation for {{ inventory_hostname }} as it does not match target {{ host_to_isolate | default('NOT_SET') }}."
+      when: not is_target_for_isolation

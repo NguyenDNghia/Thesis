@@ -1,0 +1,9 @@
+---
+- name: Block IP on all servers
+  hosts: webservers
+  become: true
+  tasks:
+    - name: Block IP using iptables
+      command: "iptables -A INPUT -s {{ ip_address }} -j DROP"
+      vars:
+        ip_address: "{{ ip_address }}"  # Tham số IP cần chặn từ alert
